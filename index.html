@@ -195,6 +195,8 @@
         <option value="shockwave">shockwave</option>
         <option value="turbulence">turbulence</option>
         <option value="fracture">fracture</option>
+        <option value="rupture">rupture</option>
+        <option value="crumble">crumble</option>
         <option value="smear">smear</option>
         <option value="glitch">glitch</option>
         <option value="melt">melt</option>
@@ -260,6 +262,7 @@
       </div>
       <label>Roughness</label><div class="row"><input type="range" id="roughness" min="0" max="100" value="20"><span id="roughnessVal">20</span></div>
       <label>Geo Break</label><div class="row"><input type="range" id="geometryBreak" min="0" max="100" value="0"><span id="geometryBreakVal">0</span></div>
+      <label>Zerstörung</label><div class="row"><input type="range" id="destruction" min="0" max="100" value="0"><span id="destructionVal">0</span></div>
     </section>
 
     <section>
@@ -313,6 +316,7 @@ const state = {
   roughenEnabled: false,
   roughness: 20,
   geometryBreak: 0,
+  destruction: 0,
   colorPrimary: "#000000",
   backgroundColor: "#ffffff",
   customFontName: "TypoLab Custom"
@@ -330,6 +334,8 @@ const effectDescriptions = {
   shockwave: "Ein Ring schiebt alles zur Seite – wie eine Druckwelle.",
   turbulence: "Mehrlagiger Perlin-Noise verwirbelt die Konturen.",
   fracture: "Simuliert gebrochene Glasscherben mit zufälligen Versätzen.",
+  rupture: "Reißt Glyphen in versetzte Blöcke und versprengt sie.",
+  crumble: "Bröselt die Konturen, als würden sie zerfallen.",
   smear: "Zieht Buchstaben entlang der Y-Achse wie verschmierte Farbe.",
   glitch: "Digitale horizontale Versätze und Sprünge.",
   melt: "Lässt die Form nach unten tropfen und einsacken.",
@@ -480,6 +486,7 @@ function bindUI() {
   link("roughenEnabled", "roughenEnabled", true);
   link("roughness", "roughness");
   link("geometryBreak", "geometryBreak");
+  link("destruction", "destruction");
 
   const effectInfo = document.getElementById("effectInfo");
   const updateEffectInfo = () => {
@@ -965,6 +972,37 @@ function applyFracture(segs, amt) {
     const radius = (pseudoNoise(id*2, id*0.11) - 0.5) * 2 * amt;
     return {...s, x: s.x + Math.cos(angle)*radius, y: s.y + Math.sin(angle)*radius };
   });
+}
+function applyRupture(segs, amt) {
+  if(!amt) return segs.map(s=>({...s}));
+  const block = Math.max(8, 120 - amt*0.9);
+  const shift = amt*0.9;
+  return segs.map(s=>{
+    if(s.x===undefined) return {...s};
+    const bx = Math.floor(s.x / block);
+    const by = Math.floor(s.y / block);
+    const n1 = sampleNoise(bx*0.7, by*0.7);
+    const n2 = sampleNoise(bx*0.7+40, by*0.7-80);
+    return {...s, x: s.x + (n1-0.5)*2*shift, y: s.y + (n2-0.5)*2*shift };
+  });
+}
+function applyCrumble(segs, amt) {
+  if(!amt) return segs.map(s=>({...s}));
+  const drop = Math.min(0.88, amt/120);
+  const fall = amt*0.9;
+  const out=[];
+  segs.forEach(cmd=>{
+    if(cmd.x===undefined) { out.push({...cmd}); return; }
+    if(cmd.type!=="M") {
+      const n = sampleNoise(cmd.x*0.025, cmd.y*0.025);
+      if(n < drop && cmd.type!=="Z") return;
+      const drift = (n-0.5)*2*amt*0.35;
+      out.push({...cmd, x: cmd.x + drift, y: cmd.y + fall*(0.2 + n*0.8) + drift*0.25 });
+      return;
+    }
+    out.push({...cmd});
+  });
+  return out;
 }
 function applySmear(segs, amt) {
   if(!amt) return segs.map(s=>({...s}));
@@ -1677,6 +1715,24 @@ function applyGeometryBreak(segs, amt) {
     return {...s, x: snapX + offset, y: snapY - offset*0.5 };
   });
 }
+function applyDestruction(segs, amt) {
+  if(!amt) return segs.map(s=>({...s}));
+  const cell = Math.max(6, 90 - amt*0.7);
+  const shift = amt*0.7;
+  const drop = Math.min(0.85, amt/160);
+  const out=[];
+  segs.forEach(cmd=>{
+    if(cmd.x===undefined) { out.push({...cmd}); return; }
+    if(cmd.type==="M") { out.push({...cmd}); return; }
+    const gx = Math.floor(cmd.x / cell);
+    const gy = Math.floor(cmd.y / cell);
+    const n1 = sampleNoise(gx*0.6, gy*0.6);
+    const n2 = sampleNoise(gx*0.6+20, gy*0.6-40);
+    if(n1 < drop) return;
+    out.push({...cmd, x: cmd.x + (n1-0.5)*2*shift, y: cmd.y + (n2-0.5)*2*shift });
+  });
+  return out;
+}
 function applyAnomaly(segs, amt) {
   if(!amt) return segs.map(s=>({...s}));
   const scale = 0.02;
@@ -1748,6 +1804,8 @@ const globalEffectHandlers = {
   shockwave: applyShockwave,
   turbulence: applyTurbulence,
   fracture: applyFracture,
+  rupture: applyRupture,
+  crumble: applyCrumble,
   smear: applySmear,
   glitch: applyGlitch,
   melt: applyMelt,
@@ -1821,6 +1879,7 @@ function applyGlobalEffects(segs) {
   if(handler) out = handler(out, state.distortionAmount);
   if(state.roughenEnabled && state.roughness>0) out = applyRoughen(out, state.roughness);
   if(state.geometryBreak>0) out = applyGeometryBreak(out, state.geometryBreak);
+  if(state.destruction>0) out = applyDestruction(out, state.destruction);
   return out;
 }
 function getRenderedSegments(g) {
@@ -2081,6 +2140,68 @@ function ensureAlphabetGlyphs() {
   }
 }
 
+function getExportCharacters() {
+  const baseSets = [
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+    "0123456789",
+    "äöüÄÖÜß",
+    `.,;:!?'"^~_-+=*/\\|@#$%&()[]{}<>`,
+    " "
+  ];
+  const seen = new Set();
+  const out = [];
+  baseSets.forEach(set=>{
+    for(const ch of set) {
+      if(seen.has(ch)) continue;
+      seen.add(ch);
+      out.push(ch);
+    }
+  });
+  glyphs.forEach(g=>{
+    if(!g?.char || seen.has(g.char)) return;
+    seen.add(g.char);
+    out.push(g.char);
+  });
+  return out;
+}
+
+function hasSourceGlyph(ch) {
+  if(state.font) {
+    try {
+      const g = state.font.charToGlyph(ch);
+      if(!g) return false;
+      if(g.name && g.name !== ".notdef") return true;
+      if(g.unicode !== undefined && g.unicode !== null) return true;
+      return false;
+    } catch(e) { return false; }
+  }
+  if(state.svgFont) return !!state.svgFont.glyphs[ch];
+  return false;
+}
+
+function createGlyphForExport(ch, template) {
+  if(!hasSourceGlyph(ch)) return null;
+  const baseX = 0;
+  const baseY = state.size;
+  const segs = state.font
+    ? buildSegmentsFromOpenType(ch, baseX, baseY)
+    : state.svgFont
+      ? buildSegmentsFromSvg(ch, baseX, baseY)
+      : [];
+  if(!segs.length) return null;
+  const glyph = new GlyphInstance(
+    crypto.randomUUID(),
+    ch,
+    segs,
+    { x:baseX, y:baseY, scaleX:1, scaleY:1, rotation:0 },
+    { strokeWidth: state.size*0.05*state.strokeScale, strokeColor: state.colorPrimary },
+    { distortionType:"none", distortionAmount:0, roughenAmount:0 }
+  );
+  applyTemplateToGlyph(glyph, template);
+  return glyph;
+}
+
 function transformPointToFont(x, y, glyph, scaleFactor) {
   let lx = (x - glyph.transform.x);
   let ly = (y - glyph.transform.y);
@@ -2121,6 +2242,14 @@ function glyphToOpenTypeGlyph(glyph, scaleFactor) {
   });
 }
 
+function createNotdefGlyph(unitsPerEm) {
+  return new opentype.Glyph({
+    name: ".notdef",
+    advanceWidth: Math.round(unitsPerEm * 0.5),
+    path: new opentype.Path()
+  });
+}
+
 function exportAlphabetFont() {
   if(!state.font && !state.svgFont) {
     alert("Bitte zuerst einen Font laden.");
@@ -2131,17 +2260,22 @@ function exportAlphabetFont() {
   fontName = fontName.trim();
   if(!fontName) fontName = "TypoLab Custom";
   state.customFontName = fontName;
-  ensureAlphabetGlyphs();
-  const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
   const unitsPerEm = state.font?.unitsPerEm || state.svgFont?.unitsPerEm || 1000;
   const scaleFactor = unitsPerEm / (state.size || 1);
-  const otGlyphs = [];
-  letters.split("").forEach(ch=>{
-    const g = glyphs.find(gl=>gl.char===ch);
+  const otGlyphs = [createNotdefGlyph(unitsPerEm)];
+  const template = getStyleTemplate();
+  const exportChars = getExportCharacters();
+  const glyphMap = new Map();
+  glyphs.forEach(g=>{
+    if(g?.char && !glyphMap.has(g.char)) glyphMap.set(g.char, g);
+  });
+  exportChars.forEach(ch=>{
+    let g = glyphMap.get(ch);
+    if(!g) g = createGlyphForExport(ch, template);
     if(!g) return;
     otGlyphs.push(glyphToOpenTypeGlyph(g, scaleFactor));
   });
-  if(!otGlyphs.length) {
+  if(otGlyphs.length <= 1) {
     alert("Keine Glyphen zum Export gefunden.");
     return;
   }
