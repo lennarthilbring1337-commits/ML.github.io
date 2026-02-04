@@ -178,6 +178,7 @@
       <label>Strichbreite</label><div class="row"><input type="range" id="strokeScale" min="0.2" max="5" step="0.1" value="1"><span id="strokeVal">1.0</span></div>
       <label>Tracking</label><div class="row"><input type="range" id="tracking" min="-100" max="200" value="0"><span id="trackingVal">0</span></div>
       <label>Zeilenabstand %</label><div class="row"><input type="range" id="lineHeight" min="80" max="200" value="110"><span id="lineHeightVal">110</span></div>
+      <label>Sampling %</label><div class="row"><input type="range" id="sampleDetail" min="40" max="200" value="100"><span id="sampleDetailVal">100</span></div>
     </section>
 
     <section>
@@ -317,6 +318,7 @@ const state = {
   roughness: 20,
   geometryBreak: 0,
   destruction: 0,
+  sampleDetail: 100,
   colorPrimary: "#000000",
   backgroundColor: "#ffffff",
   customFontName: "TypoLab Custom"
@@ -410,6 +412,25 @@ const brandFonts = ["AkUltra","FckUltra","NoiseUltra","RbUltra","TSUUltra","VvUl
 const lineHeightFactor = () => state.lineHeight / 100;
 const log = (...a) => console.log("[TypoLab]", ...a);
 const deepCopyGlyphs = () => JSON.parse(JSON.stringify(glyphs));
+const normalizeFontMetrics = (font) => {
+  if(!font) return;
+  const upm = Number.isFinite(font.unitsPerEm) && font.unitsPerEm > 0 ? font.unitsPerEm : 1000;
+  font.unitsPerEm = upm;
+  if(!Number.isFinite(font.ascender)) font.ascender = Math.round(upm * 0.8);
+  if(!Number.isFinite(font.descender)) font.descender = Math.round(-upm * 0.2);
+};
+const setRangeValue = (id, value) => {
+  const el = document.getElementById(id);
+  if(!el) return;
+  el.value = value;
+  const v = document.getElementById(id + "Val");
+  if(v) v.textContent = value;
+};
+const getSampleSpacing = () => {
+  const base = Math.max(1.2, Math.min(8, 180/(state.size || 1)));
+  const detail = Math.max(40, Math.min(200, state.sampleDetail || 100));
+  return Math.max(0.6, Math.min(12, base * (100 / detail)));
+};
 const getCanvasSize = () => {
   if(!canvas) return { width:0, height:0 };
   const ratio = window.devicePixelRatio || 1;
@@ -423,6 +444,7 @@ const randomRange = (min, max) => {
   return Math.random() * (max - min) + min;
 };
 let noiseSource = null;
+let renderScheduled = false;
 function initNoiseSource() {
   if(typeof p5 === "undefined" || noiseSource) return;
   const holder = document.createElement("div");
@@ -445,6 +467,25 @@ const sampleNoise = (x,y,z=0) => {
   if(noiseSource?.noise) return noiseSource.noise(x,y,z);
   return pseudoNoise(x,y,z);
 };
+function scheduleRender() {
+  if(renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    renderAll();
+  });
+}
+function rebuildAndRenderSafe() {
+  try {
+    buildFromText();
+    renderAll();
+    saveHistory();
+    return true;
+  } catch(err) {
+    console.error(err);
+    return false;
+  }
+}
 
 /* --- DOM Ready --- */
 document.addEventListener("DOMContentLoaded", () => {
@@ -481,6 +522,7 @@ function bindUI() {
   link("strokeScale", "strokeScale");
   link("tracking", "tracking");
   link("lineHeight", "lineHeight");
+  link("sampleDetail", "sampleDetail");
   link("distortionType", "distortionType");
   link("distortionAmount", "distortionAmount");
   link("roughenEnabled", "roughenEnabled", true);
@@ -540,11 +582,32 @@ function handleFontUpload(e) {
   }
   const reader = new FileReader();
   reader.onload = ev => {
+    let font = null;
     try {
-      const font = opentype.parse(ev.target.result);
-      state.font = font; state.svgFont = null;
-      buildFromText(); renderAll(); saveHistory();
-    } catch(err){ console.error(err); alert("Font konnte nicht geladen werden."); }
+      font = opentype.parse(ev.target.result);
+    } catch(err){
+      console.error(err);
+      alert("Font konnte nicht geladen werden.");
+      return;
+    }
+    normalizeFontMetrics(font);
+    state.font = font; state.svgFont = null;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        let ok = rebuildAndRenderSafe();
+        if(!ok) {
+          let detail = Math.max(40, Math.round((state.sampleDetail || 100) * 0.75));
+          if(detail !== state.sampleDetail) {
+            state.sampleDetail = detail;
+            setRangeValue("sampleDetail", detail);
+            ok = rebuildAndRenderSafe();
+          }
+        }
+        if(!ok) {
+          alert("Font geladen, aber Rendering fehlgeschlagen. Tipp: Sampling reduzieren.");
+        }
+      });
+    });
   };
   reader.readAsArrayBuffer(file);
 }
@@ -572,7 +635,8 @@ function getAdvanceWidthCanvas(ch) {
   if(state.font) {
     try {
       const g = state.font.charToGlyph(ch);
-      if(g && g.advanceWidth) return g.advanceWidth * (state.size / state.font.unitsPerEm);
+      const upm = Number.isFinite(state.font.unitsPerEm) && state.font.unitsPerEm > 0 ? state.font.unitsPerEm : 1000;
+      if(g && g.advanceWidth) return g.advanceWidth * (state.size / upm);
     } catch(e){ /* ignore */ }
   }
   if(state.svgFont) {
@@ -678,15 +742,14 @@ function buildAlphabetFromTemplate() {
 }
 
 function buildSegmentsFromOpenType(ch, dx, dy) {
-  const glyph = state.font.charToGlyph(ch);
-  const path = glyph.getPath(dx, dy, state.size);
-  return path.commands.map(cmd=>{
-    if(cmd.type==="M") return {type:"M",x:cmd.x,y:cmd.y};
-    if(cmd.type==="L") return {type:"L",x:cmd.x,y:cmd.y};
-    if(cmd.type==="C") return {type:"C",x1:cmd.x1,y1:cmd.y1,x2:cmd.x2,y2:cmd.y2,x:cmd.x,y:cmd.y};
-    if(cmd.type==="Q") return {type:"Q",x1:cmd.x1,y1:cmd.y1,x:cmd.x,y:cmd.y};
-    if(cmd.type==="Z") return {type:"Z"};
-  }).filter(Boolean);
+  try {
+    if(!Number.isFinite(dx) || !Number.isFinite(dy)) return [];
+    const glyph = state.font.charToGlyph(ch);
+    const path = glyph.getPath(dx, dy, state.size);
+    return sampleOpenTypePath(path);
+  } catch(e) {
+    return [];
+  }
 }
 
 function buildSegmentsFromSvg(ch, dx, dy) {
@@ -744,11 +807,11 @@ function sampleSvgPath(d, scale, dx, dy) {
   pathEl.setAttribute("d", d);
   const len = pathEl.getTotalLength();
   const scaledLen = len * scale;
-  const spacing = Math.max(1.2, Math.min(8, 180/state.size || 3));
+  const spacing = getSampleSpacing();
   const steps = Math.max(60, Math.ceil(scaledLen / spacing));
   const segs = [];
   let prev = null;
-  const jumpLimit = Math.max(4, scale * 80);
+  const jumpLimit = Math.max(4, scale * 80, spacing * 6);
   for(let i=0;i<=steps;i++){
     const p = pathEl.getPointAtLength((len*i)/steps);
     const x = p.x*scale + dx;
@@ -761,6 +824,77 @@ function sampleSvgPath(d, scale, dx, dy) {
     }
     prev = {x,y};
   }
+  return segs;
+}
+
+function sampleOpenTypePath(path) {
+  if(!path || !path.commands) return [];
+  const spacing = getSampleSpacing();
+  const minStep = Math.max(0.2, spacing * 0.35);
+  const segs = [];
+  let pen = { x:0, y:0 };
+  let start = null;
+  const addPoint = (x,y) => {
+    if(!Number.isFinite(x) || !Number.isFinite(y)) return;
+    const dx = x - pen.x;
+    const dy = y - pen.y;
+    if(Math.hypot(dx, dy) < minStep) return;
+    segs.push({ type:"L", x, y });
+    pen = { x, y };
+  };
+  path.commands.forEach(cmd=>{
+    if(cmd.type==="M") {
+      if(!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) return;
+      segs.push({ type:"M", x:cmd.x, y:cmd.y });
+      pen = { x:cmd.x, y:cmd.y };
+      start = { x:cmd.x, y:cmd.y };
+      return;
+    }
+    if(cmd.type==="L") {
+      if(!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) return;
+      addPoint(cmd.x, cmd.y);
+      return;
+    }
+    if(cmd.type==="Q") {
+      if(!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1)) return;
+      const p0 = { x: pen.x, y: pen.y };
+      const p1 = { x: cmd.x1, y: cmd.y1 };
+      const p2 = { x: cmd.x, y: cmd.y };
+      const approxLen = Math.hypot(p0.x-p1.x, p0.y-p1.y) + Math.hypot(p1.x-p2.x, p1.y-p2.y);
+      const steps = Math.max(6, Math.ceil(approxLen / spacing));
+      for(let i=1;i<=steps;i++){
+        const t = i/steps;
+        const inv = 1 - t;
+        const x = inv*inv*p0.x + 2*inv*t*p1.x + t*t*p2.x;
+        const y = inv*inv*p0.y + 2*inv*t*p1.y + t*t*p2.y;
+        addPoint(x, y);
+      }
+      return;
+    }
+    if(cmd.type==="C") {
+      if(!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1) || !Number.isFinite(cmd.x2) || !Number.isFinite(cmd.y2)) return;
+      const p0 = { x: pen.x, y: pen.y };
+      const p1 = { x: cmd.x1, y: cmd.y1 };
+      const p2 = { x: cmd.x2, y: cmd.y2 };
+      const p3 = { x: cmd.x, y: cmd.y };
+      const approxLen = Math.hypot(p0.x-p1.x, p0.y-p1.y) + Math.hypot(p1.x-p2.x, p1.y-p2.y) + Math.hypot(p2.x-p3.x, p2.y-p3.y);
+      const steps = Math.max(8, Math.ceil(approxLen / spacing));
+      for(let i=1;i<=steps;i++){
+        const t = i/steps;
+        const inv = 1 - t;
+        const x = inv*inv*inv*p0.x + 3*inv*inv*t*p1.x + 3*inv*t*t*p2.x + t*t*t*p3.x;
+        const y = inv*inv*inv*p0.y + 3*inv*inv*t*p1.y + 3*inv*t*t*p2.y + t*t*t*p3.y;
+        addPoint(x, y);
+      }
+      return;
+    }
+    if(cmd.type==="Z") {
+      if(start) addPoint(start.x, start.y);
+      segs.push({ type:"Z" });
+      start = null;
+      return;
+    }
+  });
   return segs;
 }
 
@@ -2366,7 +2500,7 @@ function onMove(e) {
     selectedGlyph.transform.rotation = angle;
   }
   updateInspector();
-  renderAll();
+  scheduleRender();
 }
 
 function onUp() {
