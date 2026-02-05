@@ -313,7 +313,7 @@
         <div class="row"><input type="range" id="lineHeight" min="80" max="200" value="110"><span
             id="lineHeightVal">110</span></div>
         <label style="display:none;">Sampling %</label>
-        <div class="row" style="display:none;"><input type="range" id="sampleDetail" min="40" max="200"
+        <div class="row" style="display:none;"><input type="range" id="sampleDetail" min="10" max="200"
             value="100"><span id="sampleDetailVal">100</span></div>
       </section>
 
@@ -325,6 +325,7 @@
           <option value="wave">wave</option>
           <option value="zigzag">zigzag</option>
           <option value="noise">noise</option>
+          <option value="shiver">shiver</option>
           <option value="twist">twist</option>
           <option value="bulge">bulge</option>
           <option value="shear">shear</option>
@@ -338,6 +339,8 @@
           <option value="glitch">glitch</option>
           <option value="melt">melt</option>
           <option value="disintegrate">disintegrate</option>
+          <option value="erode">erode</option>
+          <option value="scorch">scorch</option>
           <option value="implode">implode</option>
           <option value="explode">explode</option>
           <option value="shred">shred</option>
@@ -401,6 +404,9 @@
         <label>Stärke</label>
         <div class="row"><input type="range" id="distortionAmount" min="0" max="100" value="20"><span
             id="distortionVal">20</span></div>
+        <label>Noise Scale</label>
+        <div class="row"><input type="range" id="noiseScale" min="0.2" max="5" step="0.1" value="1"><span
+            id="noiseScaleVal">1.0</span></div>
         <div class="row" style="margin-top:6px;">
           <input type="checkbox" id="roughenEnabled" style="width:auto;"><span
             style="font-size:12px;color:var(--muted);">Roughen</span>
@@ -465,6 +471,7 @@
       lineHeight: 110,
       distortionType: "wave",
       distortionAmount: 20,
+      noiseScale: 1,
       roughenEnabled: false,
       roughness: 20,
       geometryBreak: 0,
@@ -480,6 +487,7 @@
       wave: "Horizontale Sinus-Wellen verbiegen die Linien rhythmisch.",
       zigzag: "Jeder zweite Punkt springt nach oben/unten für harte Zacken.",
       noise: "Additiver Random-Offset zerreißt die Linien leicht chaotisch.",
+      shiver: "Mikro-Jitter + Noise-Drift: vibrierende, instabile Konturen.",
       twist: "Rotiert Glyphen abhängig vom Abstand zum Zentrum.",
       bulge: "Wölbt die Form radial nach außen oder innen.",
       shear: "Schiebt die Glyphen entlang einer Scherachse.",
@@ -493,6 +501,8 @@
       glitch: "Digitale horizontale Versätze und Sprünge.",
       melt: "Lässt die Form nach unten tropfen und einsacken.",
       disintegrate: "Löst Teile zufällig auf und jittert die Überreste.",
+      erode: "Erosion: frisst Liniensegmente weg und lässt Reste ausfransen.",
+      scorch: "Scorch: verbrennt Teile (Dropout) + Hitze-Verzug nach unten.",
       implode: "Zieht alles aggressiv zum Zentrum.",
       explode: "Sprengt Glyphen radial auseinander.",
       shred: "Zerreißt Buchstaben in gegeneinander verschobene Streifen.",
@@ -563,6 +573,12 @@
     const lineHeightFactor = () => state.lineHeight / 100;
     const log = (...a) => console.log("[TypoLab]", ...a);
     const deepCopyGlyphs = () => JSON.parse(JSON.stringify(glyphs));
+    const getSerializableState = () => {
+      // IMPORTANT: state.font (OpenType Font) has circular refs -> cannot be JSON-stringified.
+      // Keep svgFont (plain object) serializable; exclude only the OpenType font instance.
+      const { font, ...rest } = state;
+      return rest;
+    };
     const normalizeFontMetrics = (font) => {
       if (!font) return;
       const upm = Number.isFinite(font.unitsPerEm) && font.unitsPerEm > 0 ? font.unitsPerEm : 1000;
@@ -578,12 +594,14 @@
       if (v) v.textContent = value;
     };
     const getSampleSpacing = () => {
-      const base = Math.max(1.2, Math.min(8, 180 / (state.size || 1)));
-      const detail = Math.max(40, Math.min(200, state.sampleDetail || 100));
-      return Math.max(0.6, Math.min(12, base * (100 / detail)));
+      const size = Math.max(1, state.size || 140);
+      const detail = Math.max(10, Math.min(200, state.sampleDetail || 100));
+      // Base spacing in canvas pixels; larger font => larger spacing; higher detail => smaller spacing.
+      const base = Math.max(1.5, Math.min(18, size / 20));
+      return Math.max(0.8, Math.min(32, base * (100 / detail)));
     };
     const getSamplingLimits = () => {
-      const detail = Math.max(40, Math.min(200, state.sampleDetail || 100));
+      const detail = Math.max(10, Math.min(200, state.sampleDetail || 100));
       const scale = detail / 100;
       return {
         maxCurveSteps: Math.round(60 + 140 * scale),
@@ -625,6 +643,10 @@
       return s - Math.floor(s);
     };
     const sampleNoise = (x, y, z = 0) => {
+      const scale = Number.isFinite(state.noiseScale) && state.noiseScale > 0 ? state.noiseScale : 1;
+      x *= scale;
+      y *= scale;
+      z *= scale;
       if (noiseSource?.noise) return noiseSource.noise(x, y, z);
       return pseudoNoise(x, y, z);
     };
@@ -801,6 +823,7 @@
       link("sampleDetail", "sampleDetail");
       link("distortionType", "distortionType");
       link("distortionAmount", "distortionAmount");
+      link("noiseScale", "noiseScale");
       link("roughenEnabled", "roughenEnabled", true);
       link("roughness", "roughness");
       link("geometryBreak", "geometryBreak");
@@ -1124,60 +1147,6 @@
       saveHistory();
     }
 
-    // OpenType Path Sampling mit Error-Handling
-    function sampleOpenTypePath(path) {
-      try {
-        const segments = [];
-        const commands = path.commands;
-        if (!commands || commands.length === 0) return [];
-
-        const samplingFactor = Math.max(3, Math.floor((state.sampleDetail || 50) / 10));
-
-        for (let i = 0; i < commands.length; i++) {
-          const cmd = commands[i];
-
-          if (cmd.type === 'M') {
-            segments.push({ type: 'M', x: cmd.x, y: cmd.y });
-          } else if (cmd.type === 'L') {
-            segments.push({ type: 'L', x: cmd.x, y: cmd.y });
-          } else if (cmd.type === 'Q') {
-            // Quadratic Bezier
-            const prev = segments[segments.length - 1];
-            if (prev && Number.isFinite(cmd.x) && Number.isFinite(cmd.y) && Number.isFinite(cmd.x1) && Number.isFinite(cmd.y1)) {
-              for (let t = 1; t <= samplingFactor; t++) {
-                const ratio = t / samplingFactor;
-                const mt = 1 - ratio;
-                const x = mt * mt * prev.x + 2 * mt * ratio * cmd.x1 + ratio * ratio * cmd.x;
-                const y = mt * mt * prev.y + 2 * mt * ratio * cmd.y1 + ratio * ratio * cmd.y;
-                if (Number.isFinite(x) && Number.isFinite(y)) {
-                  segments.push({ type: 'L', x, y });
-                }
-              }
-            }
-          } else if (cmd.type === 'C') {
-            // Cubic Bezier
-            const prev = segments[segments.length - 1];
-            if (prev && Number.isFinite(cmd.x) && Number.isFinite(cmd.y) && Number.isFinite(cmd.x1) && Number.isFinite(cmd.y1) && Number.isFinite(cmd.x2) && Number.isFinite(cmd.y2)) {
-              for (let t = 1; t <= samplingFactor; t++) {
-                const ratio = t / samplingFactor;
-                const mt = 1 - ratio;
-                const x = mt * mt * mt * prev.x + 3 * mt * mt * ratio * cmd.x1 + 3 * mt * ratio * ratio * cmd.x2 + ratio * ratio * ratio * cmd.x;
-                const y = mt * mt * mt * prev.y + 3 * mt * mt * ratio * cmd.y1 + 3 * mt * ratio * ratio * cmd.y2 + ratio * ratio * ratio * cmd.y;
-                if (Number.isFinite(x) && Number.isFinite(y)) {
-                  segments.push({ type: 'L', x, y });
-                }
-              }
-            }
-          }
-        }
-
-        return segments;
-      } catch (err) {
-        console.error("sampleOpenTypePath Fehler:", err);
-        return [];
-      }
-    }
-
     function buildSegmentsFromOpenType(ch, dx, dy) {
       try {
         if (!Number.isFinite(dx) || !Number.isFinite(dy)) return [];
@@ -1411,106 +1380,102 @@
       if (!path || !path.commands) return [];
       const spacing = getSampleSpacing();
       const limits = getSamplingLimits();
-      const minStep = Math.max(0.8, spacing * 0.7); // Increased from 0.2 to reduce redundant points
+      const minStep = Math.max(0.8, spacing * 0.65);
+
       const segs = [];
       let pen = { x: 0, y: 0 };
       let start = null;
-      let lastAdded = null;
 
-      // Improved addPoint with angle-based filtering
-      const addPoint = (x, y, isCorner = false) => {
+      let prevOut = null;
+      let lastOut = null;
+
+      const addLinePoint = (x, y, force = false) => {
         if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
-        const dx = x - pen.x;
-        const dy = y - pen.y;
-        const dist = Math.hypot(dx, dy);
 
-        // Always add corners and first points
-        if (isCorner || !lastAdded) {
-          if (dist >= minStep * 0.5) {
-            segs.push({ type: "L", x, y });
-            pen = { x, y };
-            lastAdded = { x, y };
-            return true;
-          }
-          return false;
+        if (!lastOut) {
+          const d0 = Math.hypot(x - pen.x, y - pen.y);
+          if (!force && d0 < minStep * 0.5) return false;
+          segs.push({ type: "L", x, y });
+          prevOut = lastOut;
+          lastOut = { x, y };
+          pen = { x, y };
+          return true;
         }
 
-        // For curve points, check both distance and angle
-        if (dist < minStep) return false;
+        const dist = Math.hypot(x - lastOut.x, y - lastOut.y);
+        if (!force && dist < minStep) return false;
 
-        // Check angle change to preserve important points
-        if (lastAdded) {
-          const dx1 = lastAdded.x - pen.x;
-          const dy1 = lastAdded.y - pen.y;
-          const dx2 = x - pen.x;
-          const dy2 = y - pen.y;
-          const angle1 = Math.atan2(dy1, dx1);
-          const angle2 = Math.atan2(dy2, dx2);
-          let angleDiff = Math.abs(angle2 - angle1);
+        // Optional curvature preservation: keep points when direction changes noticeably.
+        if (!force && prevOut) {
+          const a1 = Math.atan2(lastOut.y - prevOut.y, lastOut.x - prevOut.x);
+          const a2 = Math.atan2(y - lastOut.y, x - lastOut.x);
+          let angleDiff = Math.abs(a2 - a1);
           if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
-
-          // Skip point if angle change is minimal
-          if (angleDiff < 0.05 && dist < spacing * 2) return false;
+          if (angleDiff < 0.05 && dist < spacing * 1.5) return false;
         }
 
         segs.push({ type: "L", x, y });
+        prevOut = lastOut;
+        lastOut = { x, y };
         pen = { x, y };
-        lastAdded = { x, y };
         return true;
       };
 
-      // Early exit if too many points
       let pointCount = 0;
-      const maxTotalPoints = limits.maxPoints * 1.5; // Allow some overhead before simplification
+      const maxTotalPoints = Math.round(limits.maxPoints * 1.5);
 
-      path.commands.forEach(cmd => {
-        if (pointCount > maxTotalPoints) return; // Skip if we've hit the limit
+      for (const cmd of path.commands) {
+        if (pointCount > maxTotalPoints) break;
 
         if (cmd.type === "M") {
-          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) return;
+          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) continue;
           segs.push({ type: "M", x: cmd.x, y: cmd.y });
           pen = { x: cmd.x, y: cmd.y };
           start = { x: cmd.x, y: cmd.y };
-          lastAdded = null;
-          return;
+          prevOut = null;
+          lastOut = null;
+          continue;
         }
         if (cmd.type === "L") {
-          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) return;
-          if (addPoint(cmd.x, cmd.y, true)) pointCount++;
-          return;
+          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y)) continue;
+          if (addLinePoint(cmd.x, cmd.y, true)) pointCount++;
+          continue;
         }
         if (cmd.type === "Q") {
-          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1)) return;
+          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1)) continue;
           const p0 = { x: pen.x, y: pen.y };
           const p1 = { x: cmd.x1, y: cmd.y1 };
           const p2 = { x: cmd.x, y: cmd.y };
           const points = adaptiveQuadraticSample(p0, p1, p2, spacing, limits.maxCurveSteps);
-          points.forEach(pt => {
-            if (pointCount < maxTotalPoints && addPoint(pt.x, pt.y)) pointCount++;
-          });
-          return;
+          for (const pt of points) {
+            if (pointCount > maxTotalPoints) break;
+            if (addLinePoint(pt.x, pt.y, false)) pointCount++;
+          }
+          continue;
         }
         if (cmd.type === "C") {
-          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1) || !Number.isFinite(cmd.x2) || !Number.isFinite(cmd.y2)) return;
+          if (!Number.isFinite(cmd.x) || !Number.isFinite(cmd.y) || !Number.isFinite(cmd.x1) || !Number.isFinite(cmd.y1) || !Number.isFinite(cmd.x2) || !Number.isFinite(cmd.y2)) continue;
           const p0 = { x: pen.x, y: pen.y };
           const p1 = { x: cmd.x1, y: cmd.y1 };
           const p2 = { x: cmd.x2, y: cmd.y2 };
           const p3 = { x: cmd.x, y: cmd.y };
           const points = adaptiveCubicSample(p0, p1, p2, p3, spacing, limits.maxCurveSteps);
-          points.forEach(pt => {
-            if (pointCount < maxTotalPoints && addPoint(pt.x, pt.y)) pointCount++;
-          });
-          return;
+          for (const pt of points) {
+            if (pointCount > maxTotalPoints) break;
+            if (addLinePoint(pt.x, pt.y, false)) pointCount++;
+          }
+          continue;
         }
         if (cmd.type === "Z") {
-          if (start && addPoint(start.x, start.y, true)) pointCount++;
+          if (start && addLinePoint(start.x, start.y, true)) pointCount++;
           segs.push({ type: "Z" });
           start = null;
-          return;
+          prevOut = null;
+          lastOut = null;
+          continue;
         }
-      });
+      }
 
-      // Only simplify if we exceeded the limit
       if (pointCount > limits.maxPoints) {
         const minDist = Math.max(0.6, spacing * 0.8);
         return simplifySegments(segs, minDist, limits.maxPoints);
@@ -2634,10 +2599,62 @@
       });
     }
 
+    // --- New Destroy/Instability effects ---
+    function applyShiver(segs, amt) {
+      if (!amt) return segs.map(s => ({ ...s }));
+      const t = (typeof performance !== "undefined" && performance.now) ? performance.now() * 0.001 : Date.now() * 0.001;
+      const mag = amt * 0.35;
+      return segs.map((s, i) => {
+        if (s.x === undefined) return { ...s };
+        const n1 = sampleNoise(s.x * 0.02, s.y * 0.02, t + i * 0.01);
+        const n2 = sampleNoise((s.x + 200) * 0.02, (s.y - 120) * 0.02, t - i * 0.01);
+        const jitterX = (n1 - 0.5) * 2 * mag;
+        const jitterY = (n2 - 0.5) * 2 * mag;
+        return { ...s, x: s.x + jitterX, y: s.y + jitterY };
+      });
+    }
+
+    function applyErode(segs, amt) {
+      if (!amt) return segs.map(s => ({ ...s }));
+      const drop = Math.min(0.92, amt / 110);
+      const fuzz = amt * 0.35;
+      const out = [];
+      for (let i = 0; i < segs.length; i++) {
+        const cmd = segs[i];
+        if (cmd.x === undefined) { out.push({ ...cmd }); continue; }
+        if (cmd.type === "M") { out.push({ ...cmd }); continue; }
+        const n = sampleNoise(cmd.x * 0.018, cmd.y * 0.018, i * 0.01);
+        if (n < drop && cmd.type !== "Z") continue;
+        const frayX = (sampleNoise(cmd.x * 0.04 + 50, cmd.y * 0.04 - 20, i * 0.02) - 0.5) * 2 * fuzz;
+        const frayY = (sampleNoise(cmd.x * 0.04 - 10, cmd.y * 0.04 + 70, i * 0.02) - 0.5) * 2 * fuzz;
+        out.push({ ...cmd, x: cmd.x + frayX, y: cmd.y + frayY });
+      }
+      return out;
+    }
+
+    function applyScorch(segs, amt) {
+      if (!amt) return segs.map(s => ({ ...s }));
+      const heat = amt * 0.7;
+      const burn = Math.min(0.9, amt / 120);
+      const out = [];
+      for (let i = 0; i < segs.length; i++) {
+        const cmd = segs[i];
+        if (cmd.x === undefined) { out.push({ ...cmd }); continue; }
+        if (cmd.type === "M") { out.push({ ...cmd }); continue; }
+        const n = sampleNoise(cmd.x * 0.02, cmd.y * 0.02, i * 0.01);
+        if (n < burn && cmd.type !== "Z") continue;
+        const sag = (n * n) * heat * 0.6;
+        const warp = (sampleNoise(cmd.x * 0.015 + 100, cmd.y * 0.015 - 40, i * 0.02) - 0.5) * 2 * heat * 0.25;
+        out.push({ ...cmd, x: cmd.x + warp, y: cmd.y + sag });
+      }
+      return out;
+    }
+
     const globalEffectHandlers = {
       wave: applyWave,
       zigzag: applyZigZag,
       noise: applyNoise,
+      shiver: applyShiver,
       twist: applyTwist,
       bulge: applyBulge,
       shear: applyShear,
@@ -2651,6 +2668,8 @@
       glitch: applyGlitch,
       melt: applyMelt,
       disintegrate: applyDisintegrate,
+      erode: applyErode,
+      scorch: applyScorch,
       implode: applyImplode,
       explode: applyExplode,
       shred: applyShred,
@@ -2891,7 +2910,11 @@
 
     /* --- History --- */
     function saveHistory() {
-      const snapshot = JSON.stringify({ glyphs, state });
+      const snapshot = JSON.stringify({
+        glyphs,
+        state: getSerializableState(),
+        meta: { hasFont: !!state.font }
+      });
       history.splice(historyIndex + 1);
       history.push(snapshot);
       historyIndex = history.length - 1;
@@ -2899,6 +2922,7 @@
     function restoreFromSnapshot(snap) {
       const obj = JSON.parse(snap);
       Object.assign(state, obj.state);
+      if (!obj?.meta?.hasFont) state.font = null;
       glyphs.length = 0; obj.glyphs.forEach(g => glyphs.push(g));
       selectedGlyph = null;
       refreshGlyphList();
@@ -2917,7 +2941,11 @@
 
     /* --- Project export/import --- */
     function exportProject() {
-      const data = JSON.stringify({ glyphs, state }, null, 2);
+      const data = JSON.stringify({
+        glyphs,
+        state: getSerializableState(),
+        meta: { hasFont: !!state.font }
+      }, null, 2);
       const blob = new Blob([data], { type: "application/json" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
@@ -2932,6 +2960,8 @@
         try {
           const obj = JSON.parse(ev.target.result);
           Object.assign(state, obj.state || {});
+          // If the imported project didn't have a live OpenType font attached, clear it.
+          if (!obj?.meta?.hasFont) state.font = null;
           glyphs.length = 0; (obj.glyphs || []).forEach(g => glyphs.push(g));
           selectGlyph(glyphs[0] || null);
           refreshGlyphList(); renderAll(); saveHistory();
@@ -3240,4 +3270,4 @@
   </script>
 </body>
 
-</html>x
+</html>
